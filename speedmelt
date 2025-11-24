@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Create a GCP VM and run iperf to/from it, cleanup
+set -euo pipefail
+trap 'cleanup' EXIT
+
+# ---------- Config ----------
+VM_NAME="iperf-test-$(date +%s)"
+ZONE="us-east1-b"
+REGION=$(echo "$ZONE" | sed 's/-[a-z]$//')
+IP_NAME="temp-iperf-ip-$VM_NAME"        # unique every run
+TTL_SECONDS=900                         # MAX lifetime of the VM
+DOWNLOAD_TEST_SECONDS=10		# download test duration
+UPLOAD_TEST_SECONDS=20			# upload test duration
+# ----------------------------
+
+STARTUP_SCRIPT=$(cat <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+# Prevent any interactive prompts
+echo "iperf3 iperf3/autostart boolean false" | debconf-set-selections
+export DEBIAN_FRONTEND=noninteractive
+
+# Install iperf3 non-interactively and fast
+apt update -y
+apt install -y -o Dpkg::Options::="--force-confdef" \
+               -o Dpkg::Options::="--force-confold" \
+               iperf3
+
+echo "iperf3 server starting on port 5201..."
+iperf3 -s -D
+EOF
+)
+
+cleanup() {
+    set +e
+    echo
+    echo "=== Orphaned IP check ==="
+    ORPHANS=$(gcloud compute addresses list \
+        --filter="name~^temp-iperf-ip- AND region:$REGION" \
+        --format="value(name)" 2>/dev/null || true)
+
+    if [[ -n "$ORPHANS" ]]; then
+        echo "Warning: Found orphaned temporary IPs:"
+        echo "$ORPHANS" | sed 's/^/  → /'
+        echo
+        echo "Run this to nuke them all:"
+        echo "  gcloud compute addresses delete $(echo $ORPHANS | tr '\n' ' ') --region=$REGION --quiet"
+        echo
+    else
+        echo "No orphaned IPs found – everything clean!"
+    fi
+}
+
+echo "Launching one-shot iperf VM"
+echo "VM name : $VM_NAME"
+echo "IP name : $IP_NAME"
+echo "TTL     : $((TTL_SECONDS/60)) minutes (auto-delete)"
+
+# 1. Create unique reserved IP
+echo "Reserving new temporary IP..."
+STATIC_IP=$(gcloud compute addresses create "$IP_NAME" \
+    --region="$REGION" --format='value(address)' --quiet)
+
+echo "VM will be reachable at: $STATIC_IP"
+
+# 2. Launch VM with hard 15-minute TTL
+gcloud compute instances create "$VM_NAME" \
+    --machine-type=n2-standard-8 \
+    --zone="$ZONE" \
+    --image-family=debian-12 \
+    --image-project=debian-cloud \
+    --boot-disk-size=20GB \
+    --network-tier=PREMIUM \
+    --address="$STATIC_IP" \
+    --metadata=startup-script="$STARTUP_SCRIPT" \
+    --max-run-duration="${TTL_SECONDS}s" \
+    --instance-termination-action=DELETE \
+    --quiet
+
+# 3. Wait for iperf3 (max 3 min)
+echo "Waiting for $STATIC_IP:5201 (max 3 min)..."
+if ! timeout 180 bash -c "until nc -z $STATIC_IP 5201 2>/dev/null; do sleep 2; done"; then
+    echo "ERROR: iperf3 never came up – dumping logs"
+    gcloud compute instances get-serial-port-output "$VM_NAME" --zone="$ZONE" | tail -30
+    exit 1
+fi
+
+# 4. Run the bandwidth test
+echo "iperf3 ready – melting the line"
+iperf3 -c "$STATIC_IP" -P 16 -t $DOWNLOAD_TEST_SECONDS -i 10
+iperf3 -c "$STATIC_IP" -P 16 -t $UPLOAD_TEST_SECONDS -i 10 -R
+
+echo "Done! Cleaning up.  If this fails, the VM will self-destruct in ≤$((TTL_SECONDS/60)) minutes."
+# Proactively delete the GCP VM, now that we're done.
+gcloud compute instances delete "$VM_NAME" --zone="$ZONE" --quiet 2>/dev/null || true
+
+# Proactively delete the the reserved (static) IP we created
+gcloud compute addresses delete "$IP_NAME" --region="$REGION" --quiet 2>/dev/null || true
+echo "(Orphan check running now...)"
