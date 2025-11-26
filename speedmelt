@@ -13,6 +13,9 @@ DOWNLOAD_TEST_SECONDS=10		# download test duration
 UPLOAD_TEST_SECONDS=20			# upload test duration
 # ----------------------------
 
+if [ -z "$(which nc)" ]; then echo "Please install netcat."; exit 1; fi 
+if [ -z "$(which iperf3)" ]; then echo "Please install iperf3."; exit 1; fi 
+
 STARTUP_SCRIPT=$(cat <<'EOF'
 #!/bin/bash
 set -euo pipefail
